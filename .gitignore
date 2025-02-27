@@ -1,0 +1,8 @@
+tailscale-totp-ssh
+*.sw[op]
+tailscaled.log.conf
+tailscaled.log*.txt
+tailscaled.state
+id_rsa
+README.local
+
