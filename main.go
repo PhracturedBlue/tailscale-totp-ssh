@@ -17,10 +17,12 @@ import (
 	"crypto/rand"
 	"errors"
 
+	"context"
 	"flag"
 	"strconv"
 	"regexp"
 	"strings"
+	"time"
 	"encoding/base64"
 	"path/filepath"
 	terminal "golang.org/x/term"
@@ -36,8 +38,11 @@ var (
 	configLoginUser   = flag.String("user", "", "login user")
 	configStateDir    = flag.String("statedir", "", "Tailscale state dir")
 	configHostKeyFile = flag.String("hostkey", "./id_rsa", "Host key file")
+	configDNSServer   = flag.String("dnsserver", "", "Specify DNS Server")
 	configVerbose     = flag.Bool("verbose", false, "if set, verbosely log tsnet information")
 	configPort        = flag.Int("port", 22, "listen port")
+	configNoPassword  = flag.Bool("no-password", false, "if set, don't require a password")
+	configNoTailscale = flag.Bool("no-tailscale", false, "if set, don't start tailscale")
 	configAllowedDomains      stringArrayFlags
 	configAllowedSubnets      stringArrayFlags
 	configAllowedPortRanges   intRangeArrayFlags
@@ -169,7 +174,7 @@ func initializeFlags() {
 	flag.Var(&configAllowedSubnets, "jump_subnets", "Restrict allowed jump subnets")
 	flag.Var(&configAllowedPortRanges, "jump_ports", "Restrict allowed jump ports (specify # or from-to)")
 	flag.Parse()
-	if (*configTSName == "") {
+	if (*configTSName == "" && ! *configNoTailscale) {
 		log.Fatalf("-tsname is a required flag")
 	}
 	if (*configStateDir == "") {
@@ -323,27 +328,51 @@ func isIPInSubnet(ipAddress string, subnet string) bool {
 	return ipnet.Contains(ip)
 }
 
-func validateHostPort(host string, port uint32) error {
-	r := regexp.MustCompile("(\\d+\\.\\d+\\.\\d+\\.\\d+)|([a-z0-9-]+)\\.([a-z0-9-][[a-z0-9-.]+)")
-	match := r.FindStringSubmatch(host)
-	if match == nil {
-		return errors.New("Invalid host: " + host)
-	}
-	ip_address, _, domain := match[0], match[1], match[2]
-	if ip_address != "" {
-		if len(configAllowedSubnets) > 0 {
-			ok := false
-			for _, subnet := range configAllowedSubnets {
-				if isIPInSubnet(ip_address, subnet) {
-					ok = true
-					break
-				}
-			}
-			if ! ok {
-				return fmt.Errorf("Invalid IP '%s'", ip_address)
+func checkIPAddress(ip_address string) bool {
+	if len(configAllowedSubnets) > 0 {
+		ok := false
+		for _, subnet := range configAllowedSubnets {
+			if isIPInSubnet(ip_address, subnet) {
+				ok = true
+				break
 			}
 		}
+		return ok
+	}
+	return true
+}
+
+func lookupIP(host string) ([]string, error) {
+	if *configDNSServer != "" {
+		r := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{ Timeout: time.Millisecond * time.Duration(10000), }
+				return d.DialContext(ctx, network, *configDNSServer + ":53")
+			},
+		}
+		ips, err := r.LookupHost(context.Background(), host)
+		if err != nil {
+			return nil, err
+		}
+		return ips, nil
 	} else {
+		ips, err := net.LookupHost(host)
+		if err != nil {
+			return nil, err
+		}
+		return ips, nil
+	}
+}
+
+func validateHostPort(host string, port uint32) (string, error) {
+	r := regexp.MustCompile("^(?:(\\d+\\.\\d+\\.\\d+\\.\\d+)|([a-z0-9-]+)(?:\\.([a-z0-9-][[a-z0-9-.]+))?)$")
+	match := r.FindStringSubmatch(host)
+	if match == nil {
+		return "", errors.New("Invalid host: " + host)
+	}
+	ip_address, hostname, domain := match[1], match[2], match[3]
+	if ip_address == "" {
 		if len(configAllowedDomains) > 0 {
 			ok := false
 			for _, dom := range configAllowedDomains {
@@ -353,9 +382,25 @@ func validateHostPort(host string, port uint32) error {
 				}
 			}
 			if ! ok {
-				return fmt.Errorf("Invalid domain '%s'", domain)
+				return "", fmt.Errorf("Invalid domain '%s'", domain)
 			}
 		}
+		log.Printf("Looking up: %s", host)
+		ips, err := lookupIP(host)
+		if err != nil {
+			return "", fmt.Errorf("Error looking up IP addresses for %s: %v\n", host, err)
+		}
+		for _, ip := range ips {
+			if checkIPAddress(ip) {
+				ip_address = ip
+				break
+			}
+		}
+		if ip_address == "" {
+			return "", fmt.Errorf("No valid IP address found for %s.%s", hostname, domain)
+		}
+	} else if ! checkIPAddress(ip_address) {
+		return "", fmt.Errorf("Invalid IP '%s'", ip_address)
 	}
 	if len(configAllowedPortRanges) > 0 {
 		ok := false
@@ -366,10 +411,10 @@ func validateHostPort(host string, port uint32) error {
 			}
 		}
 		if ! ok {
-			return fmt.Errorf("Invalid port '%d'", port)
+			return "", fmt.Errorf("Invalid port '%d'", port)
 		}
 	}
-	return nil
+	return ip_address, nil
 }
 
 func parseUserHostPort(line string) (string, string, string, error) {
@@ -378,12 +423,12 @@ func parseUserHostPort(line string) (string, string, string, error) {
 	if match == nil {
 		return "", "", "", errors.New("Invalid format: " +  line)
 	}
-	user, host, port := match[0], match[1], match[2]
+	user, host, port := match[1], match[2], match[3]
 	if port == "" {
 		port = "22"
 	}
 	port_num, _ := strconv.ParseUint(port, 10, 32)
-	err := validateHostPort(host, uint32(port_num))
+	host, err := validateHostPort(host, uint32(port_num))
 	if err != nil {
 		return "", "", "", err
 	}
@@ -410,6 +455,15 @@ func sessionHandler(s ssh.Session) {
 	setupAndConnectSSHClient(user, host, port, s, term)
 }
 
+func withTCP(body func(listener net.Listener)) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *configPort))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+	body(listener)
+}
+
 func withTailscale(body func(listener net.Listener)) {
 	server := &tsnet.Server{
 		Hostname: *configTSName,
@@ -429,8 +483,76 @@ func withTailscale(body func(listener net.Listener)) {
 	body(listener)
 }
 
+type localForwardChannelData struct {
+	DestAddr string
+	DestPort uint32
+
+	OriginAddr string
+	OriginPort uint32
+}
+
+//Replacement for ssh.DirectTCPIPHandler that allows converting hostname->ip-address
+func directTCPIPHandler(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
+	// Need to handle user check here if no password auth is enabled
+	if *configNoPassword && *configLoginUser != "" {
+		if ctx.User() != *configLoginUser {
+			log.Printf("Disallowing invalid user: %s", ctx.User())
+			newChan.Reject(gossh.ConnectionFailed, "connection disallowed")
+			return
+		}
+	}
+	d := localForwardChannelData{}
+	if err := gossh.Unmarshal(newChan.ExtraData(), &d); err != nil {
+		newChan.Reject(gossh.ConnectionFailed, "error parsing forward data: "+err.Error())
+		return
+	}
+	ip_address, err := validateHostPort(d.DestAddr, d.DestPort)
+	if err != nil {
+		log.Printf("port forwarding is disaallowed for %s:%d: %s", d.DestAddr, d.DestPort, err)
+		newChan.Reject(gossh.Prohibited, "port forwarding is disallowed")
+		return
+	}
+	dest := net.JoinHostPort(ip_address, strconv.FormatInt(int64(d.DestPort), 10))
+
+	var dialer net.Dialer
+	dconn, err := dialer.DialContext(ctx, "tcp", dest)
+	if err != nil {
+		log.Printf("failed to dial %s: %s", dest, err)
+		newChan.Reject(gossh.ConnectionFailed, err.Error())
+		return
+	}
+
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		dconn.Close()
+		return
+	}
+	go gossh.DiscardRequests(reqs)
+
+	go func() {
+		defer ch.Close()
+		defer dconn.Close()
+		io.Copy(ch, dconn)
+	}()
+	go func() {
+		defer ch.Close()
+		defer dconn.Close()
+		io.Copy(dconn, ch)
+	}()
+}
+
 func startSSHServer(listener net.Listener, secret string) {
-	ssh.Handle(sessionHandler)
+	ssh.Handle(func(s ssh.Session) {
+		// Need to handle user check here if no password auth is enabled
+		if *configNoPassword && *configLoginUser != "" {
+			if s.User() != *configLoginUser {
+				log.Printf("Disallowing invalid user: %s", s.User())
+				s.Exit(1)
+				return
+			}
+		}
+		sessionHandler(s)
+	})
 
 	log.Printf("starting ssh server on port %d...", *configPort)
 	forwardHandler := &ssh.ForwardedTCPHandler{}
@@ -443,7 +565,17 @@ func startSSHServer(listener net.Listener, secret string) {
 		ConnectionFailedCallback: func(conn net.Conn, err error) {
 			log.Printf("Connection failed from %s: %v", conn.RemoteAddr(), err)
 		},
-		PasswordHandler: func(ctx ssh.Context, pass string) bool {
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+		},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session": ssh.DefaultSessionHandler,
+			"direct-tcpip": directTCPIPHandler,
+		},
+	}
+	if ! *configNoPassword {
+		sshServer.SetOption(ssh.PasswordAuth(func(ctx ssh.Context, pass string) bool {
 			if *configLoginUser != "" {
 				if ctx.User() != *configLoginUser {
 					log.Printf("Disallowing invalid user: %s", ctx.User())
@@ -451,25 +583,7 @@ func startSSHServer(listener net.Listener, secret string) {
 				}
 			}
 			return totp.Validate(string(pass), secret)
-		},
-		LocalPortForwardingCallback: ssh.LocalPortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			err := validateHostPort(host, port)
-			if err == nil {
-				log.Printf("Forwrding port %s:%d", host, port)
-				return true
-			} else {
-				log.Printf("Disallowing port-forwarding for %s:%d: %s", host, port, err)
-				return false
-			}
-		}),
-		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        forwardHandler.HandleSSHRequest,
-			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
-		},
-		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"session": ssh.DefaultSessionHandler,
-			"direct-tcpip": ssh.DirectTCPIPHandler,
-		},
+		}))
 	}
 	sshServer.SetOption(ssh.HostKeyFile("./id_rsa"))
 	if err := sshServer.Serve(listener); err != nil {
@@ -478,11 +592,19 @@ func startSSHServer(listener net.Listener, secret string) {
 }
 
 func main() {
-	k := initializeKey()
 	initializeFlags()
-	secret := initializeTOTP(k)
+	secret := ""
+	if ! *configNoPassword {
+		k := initializeKey()
+		secret = initializeTOTP(k)
+	}
 
-	withTailscale(func(listener net.Listener) {
+	f := func(listener net.Listener) {
 		startSSHServer(listener, secret)
-	})
+	}
+	if *configNoTailscale {
+		withTCP(f)
+	} else {
+		withTailscale(f)
+	}
 }
