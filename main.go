@@ -184,6 +184,7 @@ func initializeFlags() {
 		}
 		*configStateDir = filepath.Join(defaultDirectory, "tailscale-totp-ssh")
 	}
+	log.Printf("Using config dir: %s", *configStateDir)
 	if _, err := os.Stat(*configHostKeyFile); err != nil {
 		log.Fatalf("Host key file %s dos not exist.  Generate with\nssh-keygen -f %s", *configHostKeyFile, *configHostKeyFile)
 	}

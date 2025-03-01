@@ -1,4 +1,4 @@
-module tailscale-totp-ssh
+module github.com/PhracturedBlue/tailscale-totp-ssh
 
 go 1.24.0
 
