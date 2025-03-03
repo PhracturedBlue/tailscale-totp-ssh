@@ -36,7 +36,7 @@ func directTCPIPHandler(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.N
 	}
 	ip_address, err := validateHostPort(d.DestAddr, d.DestPort)
 	if err != nil {
-		log.Printf("port forwarding is disaallowed for %s:%d: %s", d.DestAddr, d.DestPort, err)
+		log.Printf("port forwarding is disallowed for %s:%d: %s", d.DestAddr, d.DestPort, err)
 		newChan.Reject(gossh.Prohibited, "port forwarding is disallowed")
 		return
 	}
@@ -69,7 +69,7 @@ func directTCPIPHandler(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.N
 	}()
 }
 
-func startSSHServer(listener net.Listener, secret string) {
+func initSSHServer(secret string) *ssh.Server {
 	ssh.Handle(func(s ssh.Session) {
 		// Need to handle user check here if no password auth is enabled
 		if *configNoPassword && *configLoginUser != "" {
@@ -113,9 +113,7 @@ func startSSHServer(listener net.Listener, secret string) {
 			return validateTOTP(pass, secret)
 		}))
 	}
-	sshServer.SetOption(ssh.HostKeyFile("./id_rsa"))
-	if err := sshServer.Serve(listener); err != nil {
-            log.Fatalf("failed to serve SSH: %v", err)
-        }
+	sshServer.SetOption(ssh.HostKeyFile(*configHostKeyFile))
+	return sshServer
 }
 

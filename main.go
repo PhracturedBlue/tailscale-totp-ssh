@@ -9,33 +9,46 @@ import (
 
 	"tailscale.com/tsnet"
 )
+type Server interface {
+	Serve(net.Listener) error
+	HandleConn(net.Conn)
+}
 
-func withTCP(body func(listener net.Listener)) {
+func withTCP(server Server) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *configPort))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
-	body(listener)
+	if err := server.Serve(listener); err != nil {
+		log.Fatalf("failed to serve SSH: %v", err)
+	}
 }
 
-func withTailscale(body func(listener net.Listener)) {
-	server := &tsnet.Server{
+func withTailscale(server Server) {
+	ts := &tsnet.Server{
 		Hostname: *configTSName,
 		Dir: *configStateDir,
 	}
-	defer server.Close()
+	defer ts.Close()
 	if *configVerbose {
-		server.Logf = log.New(os.Stderr, "[tsnet] ", log.LstdFlags).Printf
+		ts.Logf = log.New(os.Stderr, "[tsnet] ", log.LstdFlags).Printf
 	} else {
-		server.Logf = nil
+		ts.Logf = nil
 	}
-	listener, err := server.Listen("tcp", fmt.Sprintf(":%d", *configPort))
+	if *configExposeSSH {
+		initTailscaleSSH(ts, server)
+	}
+	// Why is this needed if we use configExposeSSH?
+	//  If we disable it, we get a message: ssh: server has no host keys
+	listener, err := ts.Listen("tcp", fmt.Sprintf(":%d", *configPort))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
-	body(listener)
+	if err := server.Serve(listener); err != nil {
+		log.Fatalf("failed to serve SSH: %v", err)
+	}
 }
 
 func main() {
@@ -46,12 +59,10 @@ func main() {
 		secret = initializeTOTP(k)
 	}
 
-	f := func(listener net.Listener) {
-		startSSHServer(listener, secret)
-	}
+	s := initSSHServer(secret)
 	if *configNoTailscale {
-		withTCP(f)
+		withTCP(s)
 	} else {
-		withTailscale(f)
+		withTailscale(s)
 	}
 }

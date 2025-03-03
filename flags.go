@@ -23,6 +23,7 @@ var (
 	configDNSServer   = flag.String("dnsserver", "", "Specify DNS Server")
 	configVerbose     = flag.Bool("verbose", false, "if set, verbosely log tsnet information")
 	configPort        = flag.Int("port", 22, "listen port")
+	configExposeSSH   = flag.Bool("expose", false, "expose SSH as tailscale service")
 	configNoPassword  = flag.Bool("no-password", false, "if set, don't require a password")
 	configNoTailscale = flag.Bool("no-tailscale", false, "if set, don't start tailscale")
 	configAllowedDomains      stringArrayFlags
@@ -95,9 +96,17 @@ func initializeFlags() {
 		}
 		*configStateDir = filepath.Join(defaultDirectory, "tailscale-totp-ssh")
 	}
+	if (*configExposeSSH) {
+		if *configPort != 22 {
+			log.Fatal("When using -expose, -port must be 22")
+		}
+		if *configNoTailscale {
+			log.Fatal("Cannot specify both -no-tailscale and -expose")
+		}
+	}
 	log.Printf("Using config dir: %s", *configStateDir)
 	if _, err := os.Stat(*configHostKeyFile); err != nil {
-		log.Fatalf("Host key file %s dos not exist.  Generate with\nssh-keygen -f %s", *configHostKeyFile, *configHostKeyFile)
+		log.Fatalf("Host key file %s does not exist.  Generate with\nssh-keygen -f %s", *configHostKeyFile, *configHostKeyFile)
 	}
 	if len(configAllowedDomains) > 0 {
 		log.Printf("Restrict jump domains to %s", configAllowedDomains.String());
